@@ -13,7 +13,7 @@ extern crate crossbeam;
 extern crate scopeguard;
 
 use variance::InvariantLifetime as Id;
-use crossbeam::queue::MsQueue;
+use crossbeam::channel::{unbounded, Sender, Receiver};
 
 use std::{thread, mem};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -128,7 +128,7 @@ impl Pool {
     #[inline]
     pub fn shutdown(&self) {
         // Start the shutdown process.
-        self.inner.queue.push(PoolMessage::Quit);
+        self.inner.tx.send(PoolMessage::Quit).unwrap();
 
         // Wait for it to complete.
         self.wait.join()
@@ -165,11 +165,11 @@ impl Pool {
         let mut thread_sentinel = ThreadSentinel(Some(self.clone()));
 
         loop {
-            match self.inner.queue.pop() {
+            match self.inner.rx.recv().unwrap() {
                 // On Quit, repropogate and quit.
                 PoolMessage::Quit => {
                     // Repropogate the Quit message to other threads.
-                    self.inner.queue.push(PoolMessage::Quit);
+                    self.inner.tx.send(PoolMessage::Quit).unwrap();
 
                     // Cancel the thread sentinel so we don't panic waiting
                     // shutdown threads, and don't restart the thread.
@@ -191,7 +191,8 @@ impl Pool {
 }
 
 struct PoolInner {
-    queue: MsQueue<PoolMessage>,
+    rx: Receiver<PoolMessage>,
+    tx: Sender<PoolMessage>,
     thread_config: ThreadConfig,
     thread_counter: AtomicUsize
 }
@@ -204,8 +205,10 @@ impl PoolInner {
 
 impl Default for PoolInner {
     fn default() -> Self {
+        let (tx, rx) = unbounded();
         PoolInner {
-            queue: MsQueue::new(),
+            rx: rx,
+            tx: tx,
             thread_config: ThreadConfig::default(),
             thread_counter: AtomicUsize::new(1)
         }
@@ -296,12 +299,13 @@ impl<'scope> Scope<'scope> {
         let task = unsafe {
             // Safe because we will ensure the task finishes executing before
             // 'scope via joining before the resolution of `'scope`.
-            mem::transmute::<Box<Task + Send + 'scope>,
-                             Box<Task + Send + 'static>>(Box::new(job))
+            mem::transmute::<Box<dyn Task + Send + 'scope>,
+                             Box<dyn Task + Send + 'static>>(Box::new(job))
         };
 
         // Submit the task to be executed.
-        self.pool.inner.queue.push(PoolMessage::Task(task, self.wait.clone()));
+        self.pool.inner.tx.send(PoolMessage::Task(task, self.wait.clone()))
+            .unwrap();
     }
 
     /// Add a job to this scope which itself will get access to the scope.
@@ -363,7 +367,7 @@ impl<'scope> Scope<'scope> {
 
 enum PoolMessage {
     Quit,
-    Task(Box<Task + Send>, Arc<WaitGroup>)
+    Task(Box<dyn Task + Send>, Arc<WaitGroup>)
 }
 
 /// A synchronization primitive for awaiting a set of actions.
